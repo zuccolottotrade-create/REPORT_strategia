@@ -1,31 +1,238 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+# ============================================================
+# BOOTSTRAP – sys.path robusto per suite + modulo report
+# ============================================================
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve()
+
+# 1) Root suite: da env se disponibile (pipeline), altrimenti fallback
+SUITE_ROOT = Path(os.environ.get("PY_SUITE_ROOT", str(HERE.parents[2]))).resolve()
+
+# 2) Root modulo report (contiene app_io/engine/metrics se sono locali al modulo)
+REPORT_ROOT = HERE.parents[1].resolve()  # .../4. REPORT strategia
+
+# Mettiamo prima REPORT_ROOT, poi SUITE_ROOT
+for p in (REPORT_ROOT, SUITE_ROOT):
+    sp = str(p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+# ============================================================
+# IMPORT STANDARD / PROGETTO
+# ============================================================
 import argparse
 import math
-from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
 
+from shared.paths import DATA_DIR
 from app_io.loader import load_signal_csv
 from app_io.exporter import export_report_csv
 
 from engine.backtest import BacktestConfig, backtest_from_hold
-from metrics import apply_metrics
 from engine.equity_additive import equity_curve_from_trades_additive
+from metrics import apply_metrics
+from pathlib import Path
+
+
+
+# ============================================================
+# UTILS – Date range + timeframe (per intestazione CSV)
+# ============================================================
+
+def _print_report_table(df: pd.DataFrame, out_path: Path, max_rows: int = 30) -> None:
+    import pandas as pd
+
+    print("\n==============================")
+    print(" REPORT (ANTEPRIMA CSV)")
+    print("==============================")
+    print(f"Output: {out_path}")
+
+    if df is None or df.empty:
+        print("(DataFrame vuoto)\n")
+        return
+
+    pd.set_option("display.width", 220)
+    pd.set_option("display.max_columns", 100)
+    pd.set_option("display.max_colwidth", 60)
+
+    print(f"Righe: {len(df)} | Colonne: {len(df.columns)}")
+    print("Colonne:", list(df.columns))
+
+    if len(df) <= max_rows:
+        print(df.to_string(index=False))
+    else:
+        head_n = max_rows // 2
+        tail_n = max_rows - head_n
+        print("\n--- HEAD ---")
+        print(df.head(head_n).to_string(index=False))
+        print("\n--- TAIL ---")
+        print(df.tail(tail_n).to_string(index=False))
+    print("")
+
+
+
+def _print_df_table(title: str, df, max_rows: int = 20) -> None:
+    import pandas as pd
+
+    if df is None or df.empty:
+        print(f"\n=== {title} ===\n(DataFrame vuoto)\n")
+        return
+
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", 80)
+
+    n = len(df)
+    print(f"\n=== {title} ===")
+    print(f"Righe: {n} | Colonne: {len(df.columns)}")
+    print("Colonne:", list(df.columns))
+
+    if n <= max_rows:
+        print(df.to_string(index=False))
+    else:
+        print("\n--- HEAD ---")
+        print(df.head(max_rows // 2).to_string(index=False))
+        print("\n--- TAIL ---")
+        print(df.tail(max_rows // 2).to_string(index=False))
+    print("")
+
+
+
+
+
+
+def _strip_prefixes(stem: str) -> str:
+    """
+    Rimuove prefissi noti per evitare duplicazioni nel REPORT.
+    """
+    for p in ("REPORT_", "SIGNAL_"):
+        if stem.startswith(p):
+            stem = stem[len(p):]
+    return stem
+
+
+def extract_date_range(equity_df: pd.DataFrame) -> Tuple[str, str]:
+    """
+    Estrae Data Inizio e Data Fine dal dataframe equity.
+    Formato: YYYY-MM-DD HH:MM:SS
+    """
+    # 1) DatetimeIndex
+    if isinstance(equity_df.index, pd.DatetimeIndex):
+        dt = equity_df.index
+        start_ts = dt.min()
+        end_ts = dt.max()
+
+    # 2) fallback: colonna DATETIME
+    elif "DATETIME" in equity_df.columns:
+        dt = pd.to_datetime(equity_df["DATETIME"], errors="coerce")
+        start_ts = dt.min()
+        end_ts = dt.max()
+
+    else:
+        raise ValueError(
+            "Impossibile determinare Data Inizio/Fine: "
+            "manca DatetimeIndex o colonna 'DATETIME'."
+        )
+
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        raise ValueError("Date Inizio/Fine non valide (NaT).")
+
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return start_ts.strftime(fmt), end_ts.strftime(fmt)
+
+
+def detect_timeframe(equity_df: pd.DataFrame) -> str:
+    """
+    Rileva il timeframe dai timestamp dell'equity_df.
+    Ritorna: '1m','5m','15m','30m','1h','4h','1d' ecc.
+    """
+
+    import pandas as pd
+    import numpy as np
+
+    # -----------------------------
+    # Recupero asse temporale
+    # -----------------------------
+    if isinstance(equity_df.index, pd.DatetimeIndex):
+        dt = equity_df.index
+    elif "DATETIME" in equity_df.columns:
+        dt = pd.to_datetime(equity_df["DATETIME"], errors="coerce")
+    else:
+        return "unknown"
+
+    dt = dt.dropna().sort_values()
+    if len(dt) < 2:
+        return "unknown"
+
+    # -----------------------------
+    # Calcolo delta temporali
+    # -----------------------------
+    deltas = dt.diff().dropna()
+    if deltas.empty:
+        return "unknown"
+
+    # usa la mediana (robusta a buchi / outlier)
+    median_delta = deltas.median()
+
+    # conversione in secondi
+    seconds = median_delta.total_seconds()
+    if not np.isfinite(seconds) or seconds <= 0:
+        return "unknown"
+
+    # -----------------------------
+    # Mapping con tolleranza
+    # -----------------------------
+    TF_MAP = {
+        "1m": 60,
+        "5m": 5 * 60,
+        "15m": 15 * 60,
+        "30m": 30 * 60,
+        "1h": 60 * 60,
+        "2h": 2 * 60 * 60,
+        "4h": 4 * 60 * 60,
+        "1d": 24 * 60 * 60,
+        "1w": 7 * 24 * 60 * 60,
+    }
+
+    # tolleranza ±20%
+    for tf, tf_seconds in TF_MAP.items():
+        if abs(seconds - tf_seconds) / tf_seconds <= 0.20:
+            return tf
+
+    # fallback leggibile
+    if seconds < 60:
+        return "<1m"
+    if seconds < 3600:
+        return f"{int(round(seconds / 60))}m"
+    if seconds < 86400:
+        return f"{int(round(seconds / 3600))}h"
+
+    return f"{int(round(seconds / 86400))}d"
+
 
 
 # PATH default richiesto (puoi puntarlo alla tua cartella SIGNAL reale)
-DEFAULT_SIGNALS_DIR = Path("/Users/claudio 1/n8n-shared/Test Data")
-DEFAULT_REPORTS_DIR = Path("/Users/claudio 1/n8n-shared/Test Data")
+
+DEFAULT_SIGNALS_DIR = Path(os.environ.get("PY_SUITE_DATA_DIR", str(DATA_DIR)))
+DEFAULT_REPORTS_DIR = Path(os.environ.get("PY_SUITE_OUT_DIR", str(DATA_DIR)))
 
 
-def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
-    default = "Y/n" if default_yes else "y/N"
+
+def ask_yes_no(prompt: str, default_yes: bool = True, **kwargs) -> bool:
+    # Compatibilità: alcune chiamate usano default=True/False
+    if "default" in kwargs and kwargs["default"] is not None:
+        default_yes = bool(kwargs["default"])
+
+    suffix = "Y/n" if default_yes else "y/N"
     while True:
-        ans = input(f"{prompt} [{default}]: ").strip().lower()
+        ans = input(f"{prompt} [{suffix}]: ").strip().lower()
         if not ans:
             return default_yes
         if ans in ("y", "yes", "s", "si", "sì"):
@@ -33,6 +240,7 @@ def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
         if ans in ("n", "no"):
             return False
         print("Risposta non valida. Inserisci y/n.")
+
 
 
 def ask_path(prompt: str, default: Path) -> Path:
@@ -80,20 +288,53 @@ def ask_int(prompt: str, default: int) -> int:
 
 
 def list_signal_files(folder: Path) -> List[Path]:
+    """
+    Restituisce SOLO i file compatibili con il report:
+    - CSV
+    - nome che inizia con 'SIGNAL_'
+    """
     if not folder.exists():
         return []
     return sorted([p for p in folder.glob("SIGNAL_*.csv") if p.is_file()])
 
 
 def pick_file_and_load_interactive(signals_dir: Path) -> Tuple[Path, pd.DataFrame]:
+    """
+    Selezione interattiva:
+    - mostra SOLO SIGNAL_*.csv
+    - se il CSV non è conforme -> stampa FILE NON ADEGUATAMENTE FORMATTATO e ripete
+    """
+
+    # ==========================================================
+    # PIPELINE DEFAULT: file SIGNAL già deciso a monte
+    # ==========================================================
+    env_signal = os.environ.get("PY_SUITE_SIGNAL_INPUT_CSV", "").strip()
+    if env_signal:
+        src = Path(env_signal)
+        if not src.exists():
+            raise FileNotFoundError(f"PY_SUITE_SIGNAL_INPUT_CSV non trovato: {src}")
+
+        try:
+            df = load_signal_csv(src)
+            return src, df
+        except Exception as e:
+            raise RuntimeError(
+                f"File SIGNAL fornito dalla pipeline non valido: {src}\n{e}"
+            )
+
+    # ==========================================================
+    # FALLBACK: comportamento interattivo originale
+    # ==========================================================
     while True:
         files = list_signal_files(signals_dir)
         if not files:
+            print(f"\nERRORE: nessun file compatibile trovato in: {signals_dir}")
+            print("Attesi file CSV con nome che inizia con 'SIGNAL_'\n")
             raise FileNotFoundError(f"Nessun file SIGNAL_*.csv trovato in: {signals_dir}")
 
         idx = ask_choice(
             [f.name for f in files],
-            f"Seleziona il file SIGNAL su cui generare il report (cartella: {signals_dir}):",
+            f"Seleziona il file SIGNAL_ su cui generare il report (solo SIGNAL_*.csv) (cartella: {signals_dir}):",
         )
         src = files[idx]
 
@@ -244,9 +485,44 @@ def add_trade_id_and_profit(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def export_debug_signal_csv(path: Path, df: pd.DataFrame) -> None:
-    """Esporta debug CSV con separatore ';' e virgola decimale (Excel IT)."""
+    """
+    Esporta debug CSV con separatore ';' e virgola decimale (Excel IT).
+    Stampa a video un'anteprima tabellare di ciò che viene scritto.
+    """
+    import pandas as pd
+
+    # ===== STAMPA TABELLARE DI DEBUG =====
+    if df is None or df.empty:
+        print("\n[REPORT] DataFrame vuoto: nessuna riga da esportare\n")
+    else:
+        pd.set_option("display.width", 200)
+        pd.set_option("display.max_columns", 80)
+        pd.set_option("display.max_colwidth", 40)
+
+        n = len(df)
+        print("\n=== ANTEPRIMA CSV REPORT (in scrittura) ===")
+        print(f"Path: {path}")
+        print(f"Righe: {n} | Colonne: {len(df.columns)}")
+        print("Colonne:", list(df.columns))
+
+        if n <= 20:
+            print(df.to_string(index=False))
+        else:
+            print("\n--- HEAD ---")
+            print(df.head(10).to_string(index=False))
+            print("\n--- TAIL ---")
+            print(df.tail(10).to_string(index=False))
+        print("")
+
+    # ===== SCRITTURA CSV =====
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(sep=";", path_or_buf=path, index=False, encoding="utf-8-sig", decimal=",")
+    df.to_csv(
+        path_or_buf=path,
+        sep=";",
+        index=False,
+        encoding="utf-8-sig",
+        decimal=",",
+    )
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -324,29 +600,53 @@ def main() -> int:
         # -------------------------
         # Signals dir
         # -------------------------
-        signals_dir = Path(args.signals_dir)
-        if str(signals_dir) == str(DEFAULT_SIGNALS_DIR):
-            use_default = ask_yes_no(
-                f"Confermi il path di default dei file SIGNAL?\n{DEFAULT_SIGNALS_DIR}",
-                default_yes=True,
-            )
-            if not use_default:
+        # ==========================================================
+        # PATHS: se la pipeline ha già deciso, NON richiedere conferma
+        # ==========================================================
+        import os as _os  # evita conflitti con variabili locali chiamate "os"
+
+        env_data_dir = _os.environ.get("PY_SUITE_DATA_DIR", "").strip()
+        env_out_dir = _os.environ.get("PY_SUITE_OUT_DIR", "").strip()
+
+        # signals_dir
+        if env_data_dir:
+            signals_dir = Path(env_data_dir)
+        else:
+            signals_dir = Path(args.signals_dir)
+
+        # Conferma path di default SOLO se non arriva dalla pipeline
+        if (not env_data_dir) and str(signals_dir) == str(DEFAULT_SIGNALS_DIR):
+            if not ask_yes_no(
+                    f"Confermi il path di default dei file SIGNAL?\n{DEFAULT_SIGNALS_DIR}",
+                    default=True,
+            ):
                 signals_dir = ask_path("Inserisci il path alternativo dei file SIGNAL", DEFAULT_SIGNALS_DIR)
 
-        if not signals_dir.exists():
-            print(f"[ERROR] Cartella SIGNAL non trovata: {signals_dir}")
-            return 2
+        # out_dir
+        if env_out_dir:
+            out_dir = Path(env_out_dir)
+        else:
+            out_dir = DEFAULT_REPORTS_DIR
 
-        # -------------------------
-        # Output dir (qui usi DEFAULT_REPORTS_DIR)
-        # -------------------------
-        out_dir = DEFAULT_REPORTS_DIR
-        use_default_out = ask_yes_no(
-            f"Confermi la directory di default dove stampare i report?\n{DEFAULT_REPORTS_DIR}",
-            default_yes=True,
-        )
-        if not use_default_out:
-            out_dir = ask_path("Inserisci la directory alternativa dove stampare i report", DEFAULT_REPORTS_DIR)
+        # ------------------------------------------------------------
+        # Output dir (reports)
+        # - Se arriva dalla pipeline (env_out_dir), nessun prompt
+        # - Altrimenti: conferma default, se NO chiedi path alternativo
+        # ------------------------------------------------------------
+        if env_out_dir:
+            out_dir = Path(env_out_dir)
+        else:
+            out_dir = DEFAULT_REPORTS_DIR
+
+            if not ask_yes_no(
+                    f"Confermi la directory di default dove stampare i report?\n{DEFAULT_REPORTS_DIR}",
+                    default_yes=True,
+            ):
+                out_dir = ask_path(
+                    "Inserisci la directory alternativa dove stampare i report",
+                    DEFAULT_REPORTS_DIR,
+                )
+
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Report directory: {out_dir.resolve()}")
 
@@ -355,11 +655,18 @@ def main() -> int:
         # -------------------------
         if args.input.strip():
             src = Path(args.input)
-            try:
-                df = load_signal_csv(src)
-            except Exception:
-                print("\nFILE NON ADEGUATAMENTE FORMATTATO\n")
+
+            # Hard-check: Report accetta SOLO SIGNAL_*.csv
+            if not src.name.startswith("SIGNAL_"):
+                print("\nFILE NON ADEGUATAMENTE FORMATTATO")
+                print("Motivo: il report accetta solo file con nome che inizia con 'SIGNAL_'\n")
                 src, df = pick_file_and_load_interactive(signals_dir)
+            else:
+                try:
+                    df = load_signal_csv(src)
+                except Exception:
+                    print("\nFILE NON ADEGUATAMENTE FORMATTATO\n")
+                    src, df = pick_file_and_load_interactive(signals_dir)
         else:
             src, df = pick_file_and_load_interactive(signals_dir)
 
@@ -434,6 +741,27 @@ def main() -> int:
             cost_per_transaction=float(cost_per_transaction),
             transactions_per_trade=int(transactions_per_trade),
         )
+        # ✅ Data Inizio / Data Fine + Timeframe (dal file SIGNAL_, colonna 'datetime')
+        dt = pd.to_datetime(df["datetime"], errors="coerce").dropna().sort_values()
+        if len(dt) < 2:
+            raise ValueError("Impossibile calcolare Data Inizio/Fine/Timeframe: datetime insufficienti nel SIGNAL_.")
+
+        data_inizio = dt.iloc[0].strftime("%Y-%m-%d %H:%M:%S")
+        data_fine = dt.iloc[-1].strftime("%Y-%m-%d %H:%M:%S")
+
+        delta = dt.diff().dropna().mode().iloc[0]
+        seconds = int(delta.total_seconds())
+
+        if seconds < 60:
+            timeframe = f"{seconds}s"
+        elif seconds % 60 == 0 and seconds < 3600:
+            timeframe = f"{seconds // 60}m"
+        elif seconds % 3600 == 0 and seconds < 86400:
+            timeframe = f"{seconds // 3600}h"
+        elif seconds % 86400 == 0:
+            timeframe = f"{seconds // 86400}d"
+        else:
+            timeframe = str(delta)
 
         # utile per metriche che leggono initial_capital
         equity_df["initial_capital"] = float(equity_start)
@@ -441,8 +769,10 @@ def main() -> int:
         # debug: conferma colonne additive presenti
         print("[DEBUG] equity_df columns AFTER equity_additive:", list(equity_df.columns))
         if "datetime" in equity_df.columns and "equity_additive" in equity_df.columns:
-            print("[DEBUG] equity_additive tail:\n",
-                  equity_df[["datetime", "equity_additive"]].tail(5).to_string(index=False))
+            print(
+                "[DEBUG] equity_additive tail:\n",
+                equity_df[["datetime", "equity_additive"]].tail(5).to_string(index=False),
+            )
 
         # -------------------------
         # Report metriche
@@ -453,8 +783,16 @@ def main() -> int:
         print("[DEBUG] BEFORE apply_metrics() -> trades_df columns:", list(trades_df.columns))
         print("[DEBUG] trades_df head:\n", trades_df.head(3).to_string(index=False))
 
-        gp_dbg = trades_df.loc[trades_df.get("pnl_trade_eur", pd.Series(dtype=float)) > 0, "pnl_trade_eur"].sum() if "pnl_trade_eur" in trades_df.columns else None
-        gl_dbg = trades_df.loc[trades_df.get("pnl_trade_eur", pd.Series(dtype=float)) < 0, "pnl_trade_eur"].sum() if "pnl_trade_eur" in trades_df.columns else None
+        gp_dbg = (
+            trades_df.loc[trades_df.get("pnl_trade_eur", pd.Series(dtype=float)) > 0, "pnl_trade_eur"].sum()
+            if "pnl_trade_eur" in trades_df.columns
+            else None
+        )
+        gl_dbg = (
+            trades_df.loc[trades_df.get("pnl_trade_eur", pd.Series(dtype=float)) < 0, "pnl_trade_eur"].sum()
+            if "pnl_trade_eur" in trades_df.columns
+            else None
+        )
         if gp_dbg is not None and gl_dbg is not None:
             print("[DEBUG] trades_df pnl_trade_eur sums: GP=", gp_dbg, " GL=", gl_dbg, " GP+GL=", gp_dbg + gl_dbg)
 
@@ -511,7 +849,7 @@ def main() -> int:
 
             sub = report_df.loc[
                 report_df["Indicatore"].isin(["Equity Start", "Net Profit", "Equity End", "Equity End (Additive)"]),
-                cols
+                cols,
             ].copy()
 
             print(f"\n[DEBUG] {label}\n{sub.to_string(index=False)}\n")
@@ -547,16 +885,20 @@ def main() -> int:
                 vr = vr.where(vr.notna(), fallback)
             report_df["Valore_raw"] = vr
 
-        print(report_df.loc[
-                  report_df["Indicatore"].isin([
-                      "Gross Profit (-Outlier)",
-                      "Gross Loss (-Outlier)",
-                      "Net Profit (-Outlier)",
-                      "Outliers Removed (count)",
-                      "Outliers Removed (%)",
-                  ]),
-                  ["Indicatore", "Valore", "Valore_raw", "Unità"]
-              ].to_string(index=False))
+        print(
+            report_df.loc[
+                report_df["Indicatore"].isin(
+                    [
+                        "Gross Profit (-Outlier)",
+                        "Gross Loss (-Outlier)",
+                        "Net Profit (-Outlier)",
+                        "Outliers Removed (count)",
+                        "Outliers Removed (%)",
+                    ]
+                ),
+                ["Indicatore", "Valore", "Valore_raw", "Unità"],
+            ].to_string(index=False)
+        )
 
         # =========================
         # FIX: Equity End ASSOLUTO = Equity Start + Net Profit
@@ -646,20 +988,17 @@ def main() -> int:
             "Time IN Position",
             "Volatility per Trade",
             "Max Drawdown (Additive)",
-
             # ---- Buy & Hold ----
             "Buy & Hold Return (First IN -> Last Close)",
             "Buy & Hold Profit (First IN -> Close after Last OUT)",
             "Buy & Hold Profit (FILO)",
             "Strategy Outperformance",
-
             # ---- Conteggi operativi ----
             "Number of Round-Trip Trades",
             "Number of Operations (IN+OUT)",
             "Entries (OUT->IN)",
             "Exits (IN->OUT)",
             "Win Rate (Round-Trip)",
-
             # ---- PnL ----
             "Gross Profit (Winning Trades Only)",
             "Gross Loss (Losing Trades Only)",
@@ -667,9 +1006,7 @@ def main() -> int:
             "Profit Factor",
         }
 
-        report_df["Verificata"] = report_df["Indicatore"].apply(
-            lambda x: "Y" if x in verified_metrics else "N"
-        )
+        report_df["Verificata"] = report_df["Indicatore"].apply(lambda x: "Y" if x in verified_metrics else "N")
 
         # =========================
         # Check di coerenza KPI (DEBUG)
@@ -693,15 +1030,7 @@ def main() -> int:
             ].iloc[0]
         )
 
-        print(
-            "[DEBUG] CHECK KPI: GP+GL=",
-            gp + gl,
-            " NetProfit=",
-            npv,
-            " Delta=",
-            npv - (gp + gl),
-        )
-
+        print("[DEBUG] CHECK KPI: GP+GL=", gp + gl, " NetProfit=", npv, " Delta=", npv - (gp + gl))
         print("[DEBUG] CHECK KPI: GP+GL=", gp + gl, " NetProfit=", npv, " Delta=", npv - (gp + gl))
 
         # -------------------------
@@ -822,12 +1151,29 @@ def main() -> int:
         report_df["_sort_seq"] = range(len(report_df))
 
         report_df = report_df.sort_values(by=["_sort_key", "_sort_seq"], ascending=True).drop(
-            columns=["_sort_key", "_sort_seq"])
+            columns=["_sort_key", "_sort_seq"]
+        )
+
+        # -------------------------
+        # Prepend Data Inizio / Data Fine al CSV
+        # -------------------------
+        header_rows = pd.DataFrame(
+            [
+                {"Indicatore": "Data Inizio", "Valore": data_inizio},
+                {"Indicatore": "Data Fine", "Valore": data_fine},
+                {"Indicatore": "Timeframe", "Valore": timeframe},
+            ]
+        )
+
+        # evita duplicazioni accidentali
+        if not report_df["Indicatore"].isin(["Data Inizio", "Data Fine", "Timeframe"]).any():
+            report_df = pd.concat([header_rows, report_df], ignore_index=True)
 
         # -------------------------
         # Export
         # -------------------------
-        out_report = out_dir / f"REPORT_SIGNAL_{src.stem}.csv"
+        out_report = out_dir / f"REPORT_{src.stem}.csv"
+        _print_report_table(report_df, out_report, max_rows=30)
         export_report_csv(out_report, report_df)
 
         # Debug dump completo SIGNAL + Trade_ID + Trade_profit
