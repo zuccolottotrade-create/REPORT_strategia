@@ -364,6 +364,88 @@ def ask_equity_start(default: float = 100.0) -> float:
             print("⚠️ Inserisci un numero valido (es. 100 oppure 250.5)")
 
 
+
+def derive_equity_start_from_first_in_trade(trades_df: pd.DataFrame, fallback: float = 100.0) -> float:
+    """Deriva Equity Start come valore di acquisto della prima operazione IN.
+
+    Regola:
+      - prende la prima trade per tempo di ingresso (se disponibile), altrimenti per index
+      - equity_start = abs(entry_price * qty) con qty=1 se non presente
+      - se non determinabile -> fallback
+    """
+    try:
+        if not isinstance(trades_df, pd.DataFrame) or trades_df.empty:
+            return float(fallback)
+
+        df = trades_df.copy()
+
+        # ordine cronologico se possibile
+        for tcol in ("entry_time", "entry_datetime", "entry_dt", "entry_date", "open_time"):
+            if tcol in df.columns:
+                dt = pd.to_datetime(df[tcol], errors="coerce")
+                df = df.assign(_entry_dt=dt).sort_values(["_entry_dt"], kind="mergesort")
+                break
+
+        first = df.iloc[0]
+
+        entry_price = _coerce_price_scalar(first.get("entry_price", np.nan))
+        if not math.isfinite(float(entry_price)):
+            return float(fallback)
+
+        qty = None
+        for qcol in ("qty", "quantity", "size", "contracts", "n_contracts"):
+            if qcol in df.columns:
+                qty = _coerce_price_scalar(first.get(qcol, 1.0))
+                break
+        qty = 1.0 if qty is None or not math.isfinite(float(qty)) else float(qty)
+
+        eq = abs(float(entry_price) * qty)
+        if not math.isfinite(eq) or eq <= 0:
+            return float(fallback)
+        return float(eq)
+    except Exception:
+        return float(fallback)
+
+
+def derive_equity_start_from_first_in_signal(df: pd.DataFrame, fallback: float = 100.0) -> float:
+    """
+    Equity Start = VALUE della prima operazione IN nel file SIGNAL_.
+
+    ⚠️ Nota di dominio (Py_SUITE_TRADING):
+      - SIGNAL non assume mai 'IN'
+      - la colonna che marca l'ingresso è HOLD == 'IN'
+      - il valore monetario da usare è VALUE (prima occorrenza HOLD == 'IN')
+
+    Regola:
+      - considera IN dove HOLD == 'IN' (case-insensitive)
+      - prende VALUE (deve essere presente e != 0)
+      - ritorna abs(VALUE)
+      - se nessun IN valido -> fallback
+    """
+    try:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return float(fallback)
+
+        if "HOLD" not in df.columns or "VALUE" not in df.columns:
+            return float(fallback)
+
+        hold = df["HOLD"].astype(str).str.upper().str.strip()
+        in_df = df.loc[hold == "IN"]
+
+        if in_df.empty:
+            return float(fallback)
+
+        # prima riga HOLD == IN con VALUE valido (!=0)
+        for _, row in in_df.iterrows():
+            v = _coerce_price_scalar(row.get("VALUE"))
+            if math.isfinite(v) and abs(v) > 0:
+                return float(abs(v))
+
+        return float(fallback)
+    except Exception:
+        return float(fallback)
+
+
 def _debug_df_snapshot(df: pd.DataFrame, label: str, cols: list[str] | None = None, n: int = 5) -> None:
     print("\n" + "=" * 90)
     print(f"[DEBUG] {label}")
@@ -402,6 +484,25 @@ def _coerce_price_series(x: pd.Series) -> pd.Series:
     s = s.str.replace(",", ".", regex=False)
 
     return pd.to_numeric(s, errors="coerce")
+
+
+
+def _coerce_price_scalar(v: object) -> float:
+    """Converte uno scalar prezzo a float gestendo virgola/punto e separatori migliaia."""
+    if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+        return float("nan")
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return float("nan")
+    if "," in s:
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return float("nan")
 
 
 def _get_trade_event_series(df: pd.DataFrame) -> pd.Series:
@@ -484,6 +585,190 @@ def add_trade_id_and_profit(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_time_features(df: pd.DataFrame, datetime_col: str = "datetime") -> pd.DataFrame:
+    """Add time-derived columns for reporting/analysis.
+
+    This does **not** alter upstream pipeline files; it only enriches the
+    DataFrame used for REPORT_DEBUG / time analytics.
+
+    Adds (if datetime is available):
+      - HOUR (0-23)
+      - DAY_OF_WEEK (0=Mon)
+      - DAY_NAME (localized in English, stable)
+      - SESSION (EU/US/ASIA - simple heuristic)
+    """
+    if df is None or df.empty:
+        return df
+
+    if datetime_col in df.columns:
+        dt = pd.to_datetime(df[datetime_col], errors="coerce")
+    elif "DATETIME" in df.columns:
+        dt = pd.to_datetime(df["DATETIME"], errors="coerce")
+    elif isinstance(df.index, pd.DatetimeIndex):
+        dt = df.index
+    else:
+        return df
+
+    df = df.copy()
+    df["HOUR"] = dt.dt.hour
+    df["DAY_OF_WEEK"] = dt.dt.dayofweek
+    try:
+        df["DAY_NAME"] = dt.dt.day_name()
+    except Exception:
+        # fallback (very old pandas)
+        df["DAY_NAME"] = df["DAY_OF_WEEK"].map({0:"Monday",1:"Tuesday",2:"Wednesday",3:"Thursday",4:"Friday",5:"Saturday",6:"Sunday"})
+
+    def _session_from_hour(h: float) -> str:
+        if pd.isna(h):
+            return "NA"
+        h = int(h)
+        # heuristic for European user; adjust if needed
+        if 7 <= h < 16:
+            return "EU"
+        if 14 <= h < 22:
+            return "US"
+        return "ASIA"
+
+    df["SESSION"] = df["HOUR"].apply(_session_from_hour)
+    return df
+
+
+def compute_avg_operations_per_week(df: pd.DataFrame, datetime_col: str = "datetime", hold_col: str = "HOLD") -> float:
+    """Average number of operations (IN+OUT) per week.
+
+    Definition (robust):
+      - an operation occurs when HOLD changes value (0->1 entry, 1->0 exit)
+      - operations are counted per ISO week and averaged across weeks with at least 1 operation
+
+    Notes:
+      - This function is used in reporting, so it tries to be permissive with column names.
+      - If per-week bucketing cannot be computed (missing datetime/hold), caller can fallback to range-based average.
+    """
+    if df is None or df.empty:
+        return float("nan")
+
+    d = df.copy()
+
+    # Datetime: accept common variants
+    dt = None
+    if datetime_col in d.columns:
+        dt = pd.to_datetime(d[datetime_col], errors="coerce")
+    else:
+        for c in ("DATETIME", "DateTime", "date_time", "timestamp", "Timestamp", "DATE", "Date", "date", "TIME", "Time"):
+            if c in d.columns:
+                dt = pd.to_datetime(d[c], errors="coerce")
+                break
+        if dt is None:
+            if isinstance(d.index, pd.DatetimeIndex):
+                dt = d.index
+            else:
+                return float("nan")
+
+    # HOLD: accept common variants
+    hold_series = None
+    if hold_col in d.columns:
+        hold_series = d[hold_col]
+    else:
+        for c in ("HOLD", "hold", "IN_POSITION", "in_position", "IN_POS", "POSITION", "position"):
+            if c in d.columns:
+                hold_series = d[c]
+                break
+        if hold_series is None:
+            return float("nan")
+
+    hold = pd.to_numeric(hold_series, errors="coerce")
+    chg = hold.ne(hold.shift(1))
+    # first row may be change from NaN; ignore
+    chg.iloc[0] = False
+
+    ops_dt = dt[chg]
+    ops_dt = ops_dt.dropna()
+    if ops_dt.empty:
+        return 0.0
+
+    # ISO week buckets (Mon-Sun)
+    ops_week = ops_dt.dt.to_period("W-MON").astype(str)
+    counts = ops_week.value_counts()
+    if counts.empty:
+        return 0.0
+
+    return float(counts.mean())
+
+
+def compute_time_stats(debug_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Compute PnL stats by time buckets from REPORT_DEBUG dataframe.
+
+    Uses Trade_profit (present only on OUT rows) when available.
+    Returns:
+      - stats_df: aggregated table (HOUR/DAY_NAME/SESSION)
+      - summary: best/worst buckets (strings) for quick inclusion in report_df
+    """
+    if debug_df is None or debug_df.empty:
+        return pd.DataFrame(), {}
+
+    df = debug_df.copy()
+
+    # Ensure time features exist
+    df = add_time_features(df, datetime_col="datetime")
+
+    # Focus on closed trades (Trade_profit available on OUT rows)
+    if "Trade_profit" not in df.columns:
+        return pd.DataFrame(), {}
+
+    trade_pnl = pd.to_numeric(df["Trade_profit"], errors="coerce")
+    out_mask = trade_pnl.notna()
+    tdf = df.loc[out_mask].copy()
+    tdf["Trade_profit"] = trade_pnl.loc[out_mask]
+
+    if tdf.empty:
+        return pd.DataFrame(), {}
+
+    def _agg(group_cols: list[str]) -> pd.DataFrame:
+        g = tdf.groupby(group_cols, dropna=False)["Trade_profit"]
+        out = g.agg(Trades="count", Net_Profit="sum", Avg_Profit="mean", Std_Profit="std").reset_index()
+        out["Win_Rate"] = g.apply(lambda s: float((s > 0).mean()) if len(s) else float("nan")).values
+        return out
+
+    stats_hour = _agg(["HOUR"]).sort_values("HOUR")
+    stats_day = _agg(["DAY_OF_WEEK", "DAY_NAME"]).sort_values(["DAY_OF_WEEK"])
+    stats_sess = _agg(["SESSION"]).sort_values("SESSION")
+
+    # build a single export-friendly table with a section column
+    stats_hour.insert(0, "SECTION", "BY_HOUR")
+    stats_day.insert(0, "SECTION", "BY_DAY")
+    stats_sess.insert(0, "SECTION", "BY_SESSION")
+
+    stats_df = pd.concat([stats_hour, stats_day, stats_sess], ignore_index=True)
+
+    summary: dict = {}
+
+    try:
+        best_hour = stats_hour.loc[stats_hour["Net_Profit"].idxmax()]
+        worst_hour = stats_hour.loc[stats_hour["Net_Profit"].idxmin()]
+        summary["Best Hour (Net Profit)"] = f"{int(best_hour['HOUR']):02d}:00 (Net={best_hour['Net_Profit']:.2f}, Trades={int(best_hour['Trades'])})"
+        summary["Worst Hour (Net Profit)"] = f"{int(worst_hour['HOUR']):02d}:00 (Net={worst_hour['Net_Profit']:.2f}, Trades={int(worst_hour['Trades'])})"
+    except Exception:
+        pass
+
+    try:
+        best_day = stats_day.loc[stats_day["Net_Profit"].idxmax()]
+        worst_day = stats_day.loc[stats_day["Net_Profit"].idxmin()]
+        summary["Best Day (Net Profit)"] = f"{best_day['DAY_NAME']} (Net={best_day['Net_Profit']:.2f}, Trades={int(best_day['Trades'])})"
+        summary["Worst Day (Net Profit)"] = f"{worst_day['DAY_NAME']} (Net={worst_day['Net_Profit']:.2f}, Trades={int(worst_day['Trades'])})"
+    except Exception:
+        pass
+
+    try:
+        best_sess = stats_sess.loc[stats_sess["Net_Profit"].idxmax()]
+        worst_sess = stats_sess.loc[stats_sess["Net_Profit"].idxmin()]
+        summary["Best Session (Net Profit)"] = f"{best_sess['SESSION']} (Net={best_sess['Net_Profit']:.2f}, Trades={int(best_sess['Trades'])})"
+        summary["Worst Session (Net Profit)"] = f"{worst_sess['SESSION']} (Net={worst_sess['Net_Profit']:.2f}, Trades={int(worst_sess['Trades'])})"
+    except Exception:
+        pass
+
+    return stats_df, summary
+
+
 def export_debug_signal_csv(path: Path, df: pd.DataFrame) -> None:
     """
     Esporta debug CSV con separatore ';' e virgola decimale (Excel IT).
@@ -563,6 +848,7 @@ def _get_metric_raw(report_df: pd.DataFrame, name: str) -> float:
 
 def _upsert_metric(report_df: pd.DataFrame, name: str, value_raw: float, unit: str) -> pd.DataFrame:
     value_str = f"{value_raw:.3f}".replace(".", ",") if math.isfinite(value_raw) else "nan"
+
     mask = report_df["Indicatore"] == name
     if mask.any():
         report_df.loc[mask, "Valore_raw"] = value_raw
@@ -570,6 +856,7 @@ def _upsert_metric(report_df: pd.DataFrame, name: str, value_raw: float, unit: s
         report_df.loc[mask, "Unità"] = unit
         return report_df
 
+    # altrimenti aggiungi nuova riga
     return pd.concat(
         [
             report_df,
@@ -588,6 +875,7 @@ def _upsert_metric(report_df: pd.DataFrame, name: str, value_raw: float, unit: s
     )
 
 
+
 def main() -> int:
     try:
         args = build_argparser().parse_args()
@@ -595,7 +883,8 @@ def main() -> int:
         # -------------------------
         # Equity Start (richiesta all'avvio) - default 100 se input vuoto
         # -------------------------
-        equity_start = ask_equity_start(default=100.0)
+        # Equity Start: non interattivo. Verrà derivato dalla prima operazione IN (entry_price*qty) se disponibile.
+        equity_start = 100.0  # fallback; verrà ricalcolato dopo il backtest se ci sono trade
 
         # -------------------------
         # Signals dir
@@ -677,6 +966,12 @@ def main() -> int:
         )
 
         # -------------------------
+        # Equity Start (AUTO): primo IN da HOLD == 'IN' (VALUE)
+        # -------------------------
+        equity_start = derive_equity_start_from_first_in_signal(df, fallback=float(equity_start))
+        print(f"[INFO] Equity Start (AUTO, first IN) = {equity_start}")
+
+        # -------------------------
         # Config backtest (usa equity_start)
         # -------------------------
         cfg = BacktestConfig(
@@ -686,6 +981,23 @@ def main() -> int:
             position_size=1.0,
         )
 
+
+        # -------------------------
+        # DEBUG / TIME FEATURES (derived from SIGNAL datetime)
+        # - calcoliamo Trade_ID + Trade_profit (solo su OUT)
+        # - aggiungiamo feature temporali (HOUR/DAY/SESSION)
+        # - pre-calcoliamo anche le statistiche time-based per export dedicato
+        # -------------------------
+        try:
+            debug_df = add_trade_id_and_profit(df)
+        except Exception as e:
+            print(f"[WARN] Impossibile calcolare Trade_ID/Trade_profit (pre): {e}")
+            debug_df = df.copy()
+            debug_df["Trade_ID"] = pd.Series([pd.NA] * len(debug_df), dtype="Int64")
+            debug_df["Trade_profit"] = np.nan
+
+        debug_df = add_time_features(debug_df, datetime_col="datetime")
+        time_stats_df, time_summary = compute_time_stats(debug_df)
         # -------------------------
         # Input costi transazione
         # -------------------------
@@ -702,6 +1014,10 @@ def main() -> int:
         print(f"[INFO] Carico: {src}")
         print("[INFO] Backtest basato su HOLD (IN/OUT)...")
         equity_df, trades_df = backtest_from_hold(df, cfg)
+        # Equity Start: per specifica deve provenire dal primo IN (VALUE) nel SIGNAL_.
+        # Se per qualsiasi motivo non fosse determinabile (fallback), proviamo come ultima chance dal trades_df.
+        if float(equity_start) == 100.0:
+            equity_start = derive_equity_start_from_first_in_trade(trades_df, fallback=float(equity_start))
 
         # =========================
         # Canonical PnL in € per trade (qty = 1)
@@ -712,8 +1028,8 @@ def main() -> int:
             if col not in trades_df.columns:
                 raise ValueError(f"trades_df non contiene '{col}': impossibile calcolare pnl_eur (qty=1).")
 
-        entry = pd.to_numeric(trades_df["entry_price"], errors="coerce")
-        exit_ = pd.to_numeric(trades_df["exit_price"], errors="coerce")
+        entry = _coerce_price_series(trades_df["entry_price"])
+        exit_ = _coerce_price_series(trades_df["exit_price"])
 
         side = (
             trades_df["side"].astype(str).str.upper().str.strip()
@@ -841,6 +1157,117 @@ def main() -> int:
         print("[DEBUG] DIRECT metric call Outliers %:", outliers_removed_pct(equity_df, trades_df))
 
         report_df = apply_metrics(equity_df, trades_df)
+        # ------------------------------------------------------------
+        # Buy & Hold:
+        # - mantieni "Buy & Hold Profit (FILO)" con la definizione originale (da apply_metrics)
+        # - aggiungi "Equity End Buy&Hold" = Buy&Hold Profit (FILO) + Equity Start
+        # ------------------------------------------------------------
+        try:
+            bh_filo_raw = _get_metric_raw(report_df, "Buy & Hold Profit (FILO)")
+            if math.isfinite(bh_filo_raw) and math.isfinite(float(equity_start)):
+                report_df = _upsert_metric(
+                    report_df,
+                    "Equity End Buy&Hold",
+                    float(bh_filo_raw) + float(equity_start),
+                    "€",
+                )
+        except Exception as e:
+            print(f"[WARN] Impossibile calcolare Equity End Buy&Hold: {e}")
+
+        # ------------------------------------------------------------
+        # Ordering: inserisci "Equity End Buy&Hold" subito dopo "Buy & Hold Profit (FILO)"
+        # ------------------------------------------------------------
+        try:
+            if "Indicatore" in report_df.columns:
+                inds = report_df["Indicatore"].astype(str).tolist()
+                if "Equity End Buy&Hold" in inds and "Buy & Hold Profit (FILO)" in inds:
+                    row_bh_end = report_df[report_df["Indicatore"].eq("Equity End Buy&Hold")]
+                    report_df = report_df[~report_df["Indicatore"].eq("Equity End Buy&Hold")].reset_index(drop=True)
+                    pos = int(report_df.index[report_df["Indicatore"].eq("Buy & Hold Profit (FILO)")][0]) + 1
+                    report_df = pd.concat([report_df.iloc[:pos], row_bh_end, report_df.iloc[pos:]], ignore_index=True)
+        except Exception as e:
+            print(f"[WARN] Impossibile riordinare Equity End Buy&Hold: {e}")
+
+
+
+        # -------------------------
+        # Fix 1: evita duplicazioni di indicatori (es. Max Drawdown Additive)
+        # -------------------------
+        try:
+            if "Indicatore" in report_df.columns:
+                # specifico: Max Drawdown (Additive) duplicato
+                mask_dd = report_df["Indicatore"].eq("Max Drawdown (Additive)")
+                if mask_dd.sum() > 1:
+                    report_df = pd.concat([report_df.loc[~mask_dd], report_df.loc[mask_dd].head(1)], ignore_index=True)
+        except Exception as e:
+            print(f"[WARN] Impossibile de-duplicare indicatori: {e}")
+
+        # -------------------------
+        # Fix 2: Avg Operations per Week (IN+OUT)
+        # -------------------------
+        try:
+            # calcolo su debug_df (se presente) altrimenti sul SIGNAL df
+            base_df = debug_df if "debug_df" in locals() else df
+            avg_ops_week = compute_avg_operations_per_week(base_df, datetime_col="datetime", hold_col="HOLD")
+
+            # fallback: if missing datetime/hold, compute average ops/week from date range and total ops
+            if not math.isfinite(avg_ops_week):
+                try:
+                    # total operations
+                    total_ops = None
+                    if "Indicatore" in report_df.columns and "Valore_raw" in report_df.columns:
+                        m_ops = report_df["Indicatore"].eq("Number of Operations (IN+OUT)")
+                        if m_ops.any():
+                            total_ops = float(report_df.loc[m_ops, "Valore_raw"].iloc[0])
+                    if total_ops is None:
+                        total_ops = float(num_ops) if "num_ops" in locals() and num_ops is not None else None
+
+                    # date range from report (if present) or equity_df
+                    dt_start = dt_end = None
+                    if "Indicatore" in report_df.columns and "Valore" in report_df.columns:
+                        m_s = report_df["Indicatore"].eq("Data Inizio")
+                        m_e = report_df["Indicatore"].eq("Data Fine")
+                        if m_s.any():
+                            dt_start = pd.to_datetime(report_df.loc[m_s, "Valore"].iloc[0], dayfirst=True, errors="coerce")
+                        if m_e.any():
+                            dt_end = pd.to_datetime(report_df.loc[m_e, "Valore"].iloc[0], dayfirst=True, errors="coerce")
+
+                    if (dt_start is None or pd.isna(dt_start) or dt_end is None or pd.isna(dt_end)) and "equity_df" in locals():
+                        try:
+                            if isinstance(equity_df.index, pd.DatetimeIndex) and len(equity_df.index) > 1:
+                                dt_start = equity_df.index.min()
+                                dt_end = equity_df.index.max()
+                        except Exception:
+                            pass
+
+                    if total_ops is not None and dt_start is not None and dt_end is not None and pd.notna(dt_start) and pd.notna(dt_end):
+                        weeks = max((dt_end - dt_start).total_seconds() / (7 * 86400.0), 1e-9)
+                        avg_ops_week = float(total_ops) / weeks
+                except Exception:
+                    pass
+
+
+            if "Indicatore" in report_df.columns and "Valore" in report_df.columns:
+                row_name = "Avg Operations per Week (IN+OUT)"
+                val_str = f"{avg_ops_week:.2f}".replace(".", ",") if math.isfinite(avg_ops_week) else "nan"
+
+                mask = report_df["Indicatore"].eq(row_name)
+                if mask.any():
+                    report_df.loc[mask, "Valore"] = val_str
+                    if "Valore_raw" in report_df.columns:
+                        report_df.loc[mask, "Valore_raw"] = float(avg_ops_week)
+                    if "Unità" in report_df.columns:
+                        report_df.loc[mask, "Unità"] = "ops/week"
+                else:
+                    new_row = {"Indicatore": row_name, "Valore": val_str}
+                    if "Valore_raw" in report_df.columns:
+                        new_row["Valore_raw"] = float(avg_ops_week)
+                    if "Unità" in report_df.columns:
+                        new_row["Unità"] = "ops/week"
+                    report_df = pd.concat([report_df, pd.DataFrame([new_row])], ignore_index=True)
+        except Exception as e:
+            print(f"[WARN] Impossibile calcolare Avg Operations per Week: {e}")
+
 
         def _dbg(label: str):
             cols = ["Indicatore", "Valore"]
@@ -942,7 +1369,34 @@ def main() -> int:
         # IMPORTANTISSIMO: upsert aggiorna Valore_raw + Valore + Unità in modo coerente
         report_df = _upsert_metric(report_df, "Expectancy (per Trade)", float(expectancy_raw), "€")
 
-        # -------------------------
+        # =========================
+        # Derivata TIME: Avg Operations per Week (IN+OUT)
+        # - calcolata da HOLD (cambi di posizione) sul dataframe bars
+        # =========================
+        avg_ops_week_raw = float("nan")
+        try:
+            # datetime source
+            if "DATETIME" in df.columns:
+                _dt = pd.to_datetime(df["DATETIME"], errors="coerce")
+            elif isinstance(df.index, pd.DatetimeIndex):
+                _dt = df.index
+            else:
+                _dt = None
+
+            if _dt is not None and "HOLD" in df.columns:
+                hold = pd.to_numeric(df["HOLD"], errors="coerce").fillna(0.0)
+                ops = hold.diff().fillna(0.0).ne(0.0).astype(int)  # 1 per ogni cambio stato (IN o OUT)
+                wk = pd.Series(ops.values, index=_dt).groupby(_dt.to_period("W")).sum()
+                if len(wk) > 0:
+                    avg_ops_week_raw = float(wk.mean())
+        except Exception as _e:
+            print("[WARN] Avg Operations per Week non calcolabile:", _e)
+
+
+
+
+
+# -------------------------
         # Debug metriche (DOPO derivata)
         # -------------------------
         def _pick(name: str):
@@ -969,7 +1423,113 @@ def main() -> int:
             s = f"{v:,.{nd}f}"  # es: 1,234.568 (US)
             return s.replace(",", "X").replace(".", ",").replace("X", ".")  # -> 1.234,568 (EU)
 
-        report_df["Valore"] = report_df["Valore_raw"].apply(lambda v: fmt_eu(v, nd=6))
+        # -------------------------
+        # LAST FIX (in-main): Avg Operations per Week (IN+OUT)
+        # - usa Valore se Valore_raw mancante
+        # - usa date/time/datetime se presenti
+        # - dayfirst=True
+        # -------------------------
+        try:
+            def _norm(s: object) -> str:
+                return " ".join(str(s).strip().split()).lower()
+        
+            def _parse_float_any(x) -> float:
+                try:
+                    if x is None:
+                        return float("nan")
+                    if isinstance(x, (int, float)):
+                        return float(x)
+                    s = str(x).strip()
+                    if s == "" or s.lower() == "nan":
+                        return float("nan")
+                    # EU -> float
+                    s = s.replace(".", "").replace(",", ".")
+                    return float(s)
+                except Exception:
+                    return float("nan")
+        
+            if "Indicatore" in report_df.columns:
+                ind_norm = report_df["Indicatore"].astype(str).map(_norm)
+        
+                # total ops: Valore_raw -> Valore
+                name_ops = "Number of Operations (IN+OUT)"
+                m_ops = ind_norm.eq(_norm(name_ops))
+                total_ops = float("nan")
+                if m_ops.any():
+                    if "Valore_raw" in report_df.columns:
+                        total_ops = _parse_float_any(report_df.loc[m_ops, "Valore_raw"].iloc[0])
+                    if not math.isfinite(total_ops) and "Valore" in report_df.columns:
+                        total_ops = _parse_float_any(report_df.loc[m_ops, "Valore"].iloc[0])
+        
+                    # se Valore_raw mancante, popolalo (evita Valore che si svuota in formattazione)
+                    if "Valore_raw" in report_df.columns and math.isfinite(total_ops):
+                        report_df.loc[m_ops, "Valore_raw"] = float(total_ops)
+        
+                # date range: preferisci Data Inizio/Fine dal report
+                dt_start = dt_end = None
+                if "Valore" in report_df.columns:
+                    m_s = ind_norm.eq(_norm("Data Inizio"))
+                    m_e = ind_norm.eq(_norm("Data Fine"))
+                    if m_s.any():
+                        dt_start = pd.to_datetime(report_df.loc[m_s, "Valore"].iloc[0], errors="coerce", dayfirst=True)
+                    if m_e.any():
+                        dt_end = pd.to_datetime(report_df.loc[m_e, "Valore"].iloc[0], errors="coerce", dayfirst=True)
+        
+                # fallback: cerca un dataframe con datetime/date+time in locals()
+                if (dt_start is None or pd.isna(dt_start) or dt_end is None or pd.isna(dt_end)):
+                    candidates = []
+                    for _nm in ("debug_df", "df", "trades_df", "equity_df"):
+                        if _nm in locals():
+                            _obj = locals().get(_nm)
+                            if isinstance(_obj, pd.DataFrame) and len(_obj) > 1:
+                                candidates.append(_obj)
+        
+                    def _extract_dt(_d: pd.DataFrame):
+                        # 1) datetime col
+                        for c in ("datetime", "Datetime", "DATETIME", "dateTime", "DateTime"):
+                            if c in _d.columns:
+                                dt = pd.to_datetime(_d[c], errors="coerce", dayfirst=True)
+                                dt = dt.dropna()
+                                if len(dt) > 1:
+                                    return dt.min(), dt.max()
+                        # 2) date + time
+                        if "date" in _d.columns and "time" in _d.columns:
+                            dt = pd.to_datetime(_d["date"].astype(str).str.strip() + " " + _d["time"].astype(str).str.strip(),
+                                               errors="coerce", dayfirst=True)
+                            dt = dt.dropna()
+                            if len(dt) > 1:
+                                return dt.min(), dt.max()
+                        # 3) index
+                        if isinstance(_d.index, pd.DatetimeIndex) and len(_d.index) > 1:
+                            return _d.index.min(), _d.index.max()
+                        return None, None
+        
+                    for _d in candidates:
+                        a,b = _extract_dt(_d)
+                        if a is not None and b is not None and pd.notna(a) and pd.notna(b):
+                            dt_start, dt_end = a,b
+                            break
+        
+                avg_ops_week = float("nan")
+                if math.isfinite(total_ops) and dt_start is not None and dt_end is not None and pd.notna(dt_start) and pd.notna(dt_end):
+                    weeks = max((dt_end - dt_start).total_seconds() / (7 * 86400.0), 1e-9)
+                    avg_ops_week = float(total_ops) / weeks
+        
+                # upsert SOLO se finito
+                if math.isfinite(avg_ops_week):
+                    report_df = _upsert_metric(report_df, "Avg Operations per Week (IN+OUT)", avg_ops_week, "ops/week")
+                    # forziamo sempre N sulla verifica
+                    if "Verificata" in report_df.columns:
+                        m_avg = report_df["Indicatore"].astype(str).str.strip().eq("Avg Operations per Week (IN+OUT)")
+                        report_df.loc[m_avg, "Verificata"] = "N"
+        
+        except Exception as e:
+            print(f"[WARN] LAST FIX Avg Ops/Week non applicato: {e}")
+        # Formattazione Valore: NON sovrascrivere con vuoto se Valore_raw è NaN
+        if "Valore_raw" in report_df.columns and "Valore" in report_df.columns:
+            _raw_num = pd.to_numeric(report_df["Valore_raw"], errors="coerce")
+            _fmt = _raw_num.apply(lambda v: fmt_eu(v, nd=6))
+            report_df["Valore"] = report_df["Valore"].where(_raw_num.isna(), _fmt)
 
         # =========================
         # Colonna "Verificata" (Y/N) – SOLO fase di stampa
@@ -980,7 +1540,7 @@ def main() -> int:
             "Equity End (Additive)",
             "Equity End",
             "Total Return (Additive)",
-            "Total Return"
+            "Total Return",
             "Max Drawdown (Additive)",
             "AVG Win",
             "AVG Loss",
@@ -996,6 +1556,7 @@ def main() -> int:
             # ---- Conteggi operativi ----
             "Number of Round-Trip Trades",
             "Number of Operations (IN+OUT)",
+            "Avg Operations per Week (IN+OUT)",
             "Entries (OUT->IN)",
             "Exits (IN->OUT)",
             "Win Rate (Round-Trip)",
@@ -1006,7 +1567,19 @@ def main() -> int:
             "Profit Factor",
         }
 
-        report_df["Verificata"] = report_df["Indicatore"].apply(lambda x: "Y" if x in verified_metrics else "N")
+        # Verificata = Y solo se (indicatore in set) e Valore_raw è numerico finito
+        if "Valore_raw" in report_df.columns:
+            _raw_num_v = pd.to_numeric(report_df["Valore_raw"], errors="coerce")
+        else:
+            _raw_num_v = pd.Series([float("nan")] * len(report_df))
+        
+        report_df["Verificata"] = [
+            "Y" if (str(ind) in verified_metrics and (isinstance(v, (int, float)) and math.isfinite(v))) else "N"
+            for ind, v in zip(report_df["Indicatore"].astype(str), _raw_num_v)
+        ]
+        # Avg Ops/Week non è mai verificata
+        m_avg_v = report_df["Indicatore"].astype(str).str.strip().eq("Avg Operations per Week (IN+OUT)")
+        report_df.loc[m_avg_v, "Verificata"] = "N"
 
         # =========================
         # Check di coerenza KPI (DEBUG)
@@ -1120,13 +1693,12 @@ def main() -> int:
             "Strategy Outperformance",
             "Total Return",
             "Number of Operations (IN+OUT)",
+            "Avg Operations per Week (IN+OUT)",
             "Transaction Costs",
             "Win Rate (Round-Trip)",
             "AVG Win",
             "AVG Loss",
-            "Expectancy (per Trade)",
-            "Max Drawdown (Additive)",
-            "Gross Profit (-Outlier)",
+            "Expectancy (per Trade)",            "Gross Profit (-Outlier)",
             "Gross Loss (-Outlier)",
             "Net Profit (-Outlier)",
             "Outliers Removed (count)",
@@ -1155,6 +1727,27 @@ def main() -> int:
         )
 
         # -------------------------
+
+        # -------------------------
+        # Time summary (best/worst buckets) -> aggiunti nel report principale
+        # -------------------------
+        try:
+            if "time_summary" in locals() and isinstance(time_summary, dict) and time_summary:
+                for k, v in time_summary.items():
+                    # evita duplicati
+                    if not report_df["Indicatore"].eq(k).any():
+                        report_df = pd.concat(
+                            [
+                                report_df,
+                                pd.DataFrame(
+                                    [{"Indicatore": k, "Valore": str(v), "Valore_raw": float("nan"), "Unità": ""}]
+                                ),
+                            ],
+                            ignore_index=True,
+                        )
+        except Exception as e:
+            print(f"[WARN] Impossibile aggiungere time summary al report: {e}")
+
         # Prepend Data Inizio / Data Fine al CSV
         # -------------------------
         header_rows = pd.DataFrame(
@@ -1176,17 +1769,26 @@ def main() -> int:
         _print_report_table(report_df, out_report, max_rows=30)
         export_report_csv(out_report, report_df)
 
-        # Debug dump completo SIGNAL + Trade_ID + Trade_profit
-        try:
-            debug_df = add_trade_id_and_profit(df)
-        except Exception as e:
-            print(f"[WARN] Impossibile calcolare Trade_ID/Trade_profit nel debug: {e}")
-            debug_df = df.copy()
-            debug_df["Trade_ID"] = pd.Series([pd.NA] * len(debug_df), dtype="Int64")
-            debug_df["Trade_profit"] = np.nan
+        # Debug dump completo SIGNAL + Trade_ID + Trade_profit (+ TIME features)
+        # Nota: debug_df/time_stats_df sono pre-calcolati sopra (subito dopo il load del SIGNAL_)
+        if "debug_df" not in locals():
+            try:
+                debug_df = add_trade_id_and_profit(df)
+            except Exception as e:
+                print(f"[WARN] Impossibile calcolare Trade_ID/Trade_profit (fallback debug): {e}")
+                debug_df = df.copy()
+                debug_df["Trade_ID"] = pd.Series([pd.NA] * len(debug_df), dtype="Int64")
+                debug_df["Trade_profit"] = np.nan
+            debug_df = add_time_features(debug_df, datetime_col="datetime")
 
         out_debug = out_dir / f"REPORT_DEBUG_{src.stem}.csv"
         export_debug_signal_csv(out_debug, debug_df)
+
+        # Export statistiche time-based (BY_HOUR / BY_DAY / BY_SESSION)
+        if "time_stats_df" in locals() and isinstance(time_stats_df, pd.DataFrame) and not time_stats_df.empty:
+            out_time = out_dir / f"REPORT_TIME_{src.stem}.csv"
+            time_stats_df.to_csv(out_time, sep=";", index=False, encoding="utf-8-sig")
+            print(f"[OK] Time stats export: {out_time}")
 
         # Verifica export (opzionale)
         if args.verify_export:
