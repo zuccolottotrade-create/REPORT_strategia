@@ -1,0 +1,164 @@
+--- report_strategia.py+++ report_strategia.py@@ -844,6 +844,106 @@         return float(s.iloc[0])
+     except Exception:
+         return float("nan")
++
++
++
++
++# ============================================================
++# MTM / Unrealized PnL (posizioni aperte)
++# ============================================================
++
++def _to_float_eu_safe(x) -> float:
++    """Converte numeri EU (es. '1.234,56') in float 1234.56. Ritorna nan se non convertibile."""
++    if x is None:
++        return float("nan")
++    if isinstance(x, (int, float, np.floating)):
++        return float(x)
++    s = str(x).strip()
++    if s == "" or s.lower() == "nan":
++        return float("nan")
++    # EU -> float: "1.234,56" -> "1234.56"
++    s = s.replace(".", "").replace(",", ".")
++    try:
++        return float(s)
++    except Exception:
++        return float("nan")
++
++
++def compute_unrealized_pnl_open(signal_df: pd.DataFrame) -> dict:
++    """Calcola PnL non realizzato (mark-to-market) per eventuale posizione ancora aperta.
++
++    Assunzioni sul tracciato SIGNAL_*.csv (Run_strategia):
++      - HOLD: 'IN' se posizione aperta, 'OUT' se flat (o riga di uscita)
++      - SIGNAL: 'LONG' / 'SHORT' sull'entry
++      - VALUE: prezzo di entry (sulla riga di entry)
++      - close: ultimo prezzo (sull'ultima riga del file)
++      - datetime: timestamp (se presente)
++
++    Ritorna:
++      {
++        has_open: bool,
++        side: 'LONG'|'SHORT'|None,
++        entry_price: float,
++        last_close: float,
++        unrealized_pnl: float,
++        entry_datetime: str
++      }
++    """
++    out = {
++        "has_open": False,
++        "side": None,
++        "entry_price": float("nan"),
++        "last_close": float("nan"),
++        "unrealized_pnl": 0.0,
++        "entry_datetime": "",
++    }
++
++    if signal_df is None or signal_df.empty:
++        return out
++
++    if "HOLD" not in signal_df.columns:
++        return out
++
++    hold = signal_df["HOLD"].astype(str).fillna("").str.strip().str.upper()
++    if hold.iloc[-1] != "IN":
++        return out  # nessuna posizione aperta a fine file
++
++    # entry = ultima transizione (prev != IN) -> IN
++    prev = hold.shift(1).fillna("")
++    entries = signal_df[(hold == "IN") & (prev != "IN")]
++    if entries.empty:
++        # fallback: prima riga IN disponibile
++        entries = signal_df[hold == "IN"]
++        if entries.empty:
++            return out
++
++    entry_row = entries.iloc[-1]
++
++    side = str(entry_row.get("SIGNAL", "")).strip().upper()
++    if side not in ("LONG", "SHORT"):
++        # fallback: se non è valorizzato correttamente, assumiamo LONG ma segnaliamo via side
++        side = "LONG"
++
++    entry_price = _to_float_eu_safe(entry_row.get("VALUE", entry_row.get("close")))
++    last_close = _to_float_eu_safe(signal_df.iloc[-1].get("close"))
++
++    if not (math.isfinite(entry_price) and math.isfinite(last_close)):
++        return out
++
++    unreal = (last_close - entry_price) if side == "LONG" else (entry_price - last_close)
++
++    out.update(
++        {
++            "has_open": True,
++            "side": side,
++            "entry_price": float(entry_price),
++            "last_close": float(last_close),
++            "unrealized_pnl": float(unreal),
++            "entry_datetime": str(entry_row.get("datetime", "")),
++        }
++    )
++    return out
++
+ 
+ 
+ def _upsert_metric(report_df: pd.DataFrame, name: str, value_raw: float, unit: str) -> pd.DataFrame:
+@@ -1173,6 +1273,58 @@                 )
+         except Exception as e:
+             print(f"[WARN] Impossibile calcolare Equity End Buy&Hold: {e}")
++
++
++        # ============================================================
++        # MTM (Mark-to-Market): includi PnL NON realizzato di eventuale posizione aperta
++        # - Overwrite: Net Profit / Gross Profit / Gross Loss diventano MTM
++        # - Preserve: aggiungiamo le versioni "Realized" + la voce "Unrealized PnL (Open)"
++        # ============================================================
++        try:
++            unr = compute_unrealized_pnl_open(df)
++
++            if unr.get("has_open", False):
++                unreal = float(unr.get("unrealized_pnl", 0.0))
++
++                # leggi versioni REALIZZATE (come calcolate da apply_metrics)
++                net_real = _get_metric_raw(report_df, "Net Profit")
++                gp_real = _get_metric_raw(report_df, "Gross Profit")
++                gl_real = _get_metric_raw(report_df, "Gross Loss")
++
++                # preserva i realizzati
++                if math.isfinite(net_real):
++                    report_df = _upsert_metric(report_df, "Net Profit (Realized)", float(net_real), "€")
++                if math.isfinite(gp_real):
++                    report_df = _upsert_metric(report_df, "Gross Profit (Realized)", float(gp_real), "€")
++                if math.isfinite(gl_real):
++                    report_df = _upsert_metric(report_df, "Gross Loss (Realized)", float(gl_real), "€")
++
++                # aggiungi unrealized (open)
++                report_df = _upsert_metric(report_df, "Unrealized PnL (Open)", unreal, "€")
++
++                # calcola MTM
++                net_mtm = (net_real if math.isfinite(net_real) else 0.0) + unreal
++
++                # gross profit/loss: assumiamo che Gross Loss sia già negativa (somma delle perdite)
++                gp_mtm = (gp_real if math.isfinite(gp_real) else 0.0) + (unreal if unreal > 0 else 0.0)
++                gl_mtm = (gl_real if math.isfinite(gl_real) else 0.0) + (unreal if unreal < 0 else 0.0)
++
++                # overwrite delle metriche principali (quelle che l'utente guarda)
++                report_df = _upsert_metric(report_df, "Net Profit", float(net_mtm), "€")
++                report_df = _upsert_metric(report_df, "Gross Profit", float(gp_mtm), "€")
++                report_df = _upsert_metric(report_df, "Gross Loss", float(gl_mtm), "€")
++
++                # extra (facoltativi ma utili per debug)
++                report_df = _upsert_metric(report_df, "Open Pos Entry Price", float(unr.get("entry_price", float("nan"))), "€")
++                report_df = _upsert_metric(report_df, "Open Pos Last Close", float(unr.get("last_close", float("nan"))), "€")
++
++                print(
++                    f"[INFO] MTM: posizione aperta {unr.get('side')} entry={unr.get('entry_price')} "
++                    f"last_close={unr.get('last_close')} unrealized={unreal:+.2f}"
++                )
++        except Exception as e:
++            print(f"[WARN] MTM/Unrealized non calcolabile: {e}")
++
+ 
+         # ------------------------------------------------------------
+         # Ordering: inserisci "Equity End Buy&Hold" subito dopo "Buy & Hold Profit (FILO)"

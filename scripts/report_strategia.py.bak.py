@@ -220,10 +220,8 @@ def detect_timeframe(equity_df: pd.DataFrame) -> str:
 
 # PATH default richiesto (puoi puntarlo alla tua cartella SIGNAL reale)
 
-DEFAULT_SIGNALS_DIR = Path(os.environ.get("PY_SUITE_DATA_DIR", str(DATA_DIR))) / "Test Data"
-
-DEFAULT_REPORT_DIR = Path(os.environ.get("PY_SUITE_DATA_DIR", str(DATA_DIR))) / "Test Data"
-
+DEFAULT_SIGNALS_DIR = Path(os.environ.get("PY_SUITE_DATA_DIR", str(DATA_DIR)))
+DEFAULT_REPORTS_DIR = Path(os.environ.get("PY_SUITE_OUT_DIR", str(DATA_DIR)))
 
 
 
@@ -1017,6 +1015,12 @@ def main() -> int:
             ):
                 signals_dir = ask_path("Inserisci il path alternativo dei file SIGNAL", DEFAULT_SIGNALS_DIR)
 
+        # out_dir
+        if env_out_dir:
+            out_dir = Path(env_out_dir)
+        else:
+            out_dir = DEFAULT_REPORTS_DIR
+
         # ------------------------------------------------------------
         # Output dir (reports)
         # - Se arriva dalla pipeline (env_out_dir), nessun prompt
@@ -1025,20 +1029,19 @@ def main() -> int:
         if env_out_dir:
             out_dir = Path(env_out_dir)
         else:
-            out_dir = DEFAULT_REPORT_DIR
+            out_dir = DEFAULT_REPORTS_DIR
 
             if not ask_yes_no(
-                    f"Confermi la directory di default dove stampare i report?\n{DEFAULT_REPORT_DIR}",
-                    default=True,
+                    f"Confermi la directory di default dove stampare i report?\n{DEFAULT_REPORTS_DIR}",
+                    default_yes=True,
             ):
                 out_dir = ask_path(
                     "Inserisci la directory alternativa dove stampare i report",
-                    DEFAULT_REPORT_DIR,
+                    DEFAULT_REPORTS_DIR,
                 )
 
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Report directory: {out_dir.resolve()}")
-©
 
         # -------------------------
         # Input file
@@ -2594,9 +2597,7 @@ def main() -> int:
             ("Total P/L (Real + Unreal)", _fmt_eu(total_pl, 6) if total_pl == total_pl else "", "€" if (total_pl == total_pl) else ""),
             ("ROCE", total_return_alpha, unit_total_return_alpha),
             ("Equity End Alpha", equity_end_alpha_str, unit_equity_end_alpha),
-            ("Buy&Hold Profit (Full Holding)", bh_full_str, bh_full_unit),
-
-
+            ("Equity End Buy&Hold", equity_end_bh, unit_equity_end_bh),
             ("Transaction Costs", tx_costs, unit_tx_costs),
             (SEP, None, None),
 
@@ -2609,9 +2610,7 @@ def main() -> int:
             ("Net Profit Alpha", net_profit_alpha_str, net_profit_alpha_unit),
             ("Unrealized Profit/Loss", unreal_pl_str, unreal_unit),
             ("Buy & Hold Profit (FILO)", bh_filo, unit_bh_filo),
-
-            ("Equity End Buy&Hold", equity_end_bh, unit_equity_end_bh),
-
+            ("Buy&Hold (Full Holding)", bh_full_str, bh_full_unit),
             ("Total Return", m("Total Return"), u("Total Return")),
             ("Max Drawdown (Additive)", m("Max Drawdown (Additive)"), u("Max Drawdown (Additive)") or "€"),
             (SEP, None, None),
