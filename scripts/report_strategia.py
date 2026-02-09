@@ -980,7 +980,30 @@ def _upsert_metric(report_df: pd.DataFrame, name: str, value_raw: float, unit: s
         ignore_index=True,
     )
 
+def _build_view_no_regime(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    View NO_REGIME: copia le colonne *_no_regime dentro i nomi standard,
+    così possiamo riusare backtest_from_hold + apply_metrics senza duplicare logica.
+    """
+    out = df.copy()
 
+    base_cols = [
+        "SIGNAL", "HOLD", "VALUE",
+        "Profit/Trade", "Trade_ID",
+        "Minutes_IN_to_OUT", "Minutes_OUT_to_next_IN",
+        "Sum Profit/Trade", "Avg Profit/Trade",
+        "Win Rate",
+        "Max DD Start", "Max DD Peak",
+        "Trades/Day_8h_AvgIdle", "Trades/Day_8h_MedIdle",
+        "Trades/Week_8h_AvgIdle", "Trades/Week_8h_MedIdle",
+    ]
+
+    for c in base_cols:
+        cn = f"{c}_no_regime"
+        if cn in out.columns:
+            out[c] = out[cn]
+
+    return out
 
 def main() -> int:
     try:
@@ -1038,7 +1061,6 @@ def main() -> int:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[INFO] Report directory: {out_dir.resolve()}")
-©
 
         # -------------------------
         # Input file
@@ -1144,6 +1166,48 @@ def main() -> int:
         print(f"[INFO] Carico: {src}")
         print("[INFO] Backtest basato su HOLD (IN/OUT)...")
         equity_df, trades_df = backtest_from_hold(df, cfg)
+        # =============================================================
+        # NO_REGIME: backtest parallelo usando colonne *_no_regime
+        # =============================================================
+        df_no_regime = _build_view_no_regime(df)
+
+        equity_start_no_regime = derive_equity_start_from_first_in_signal(
+            df_no_regime, fallback=float(equity_start)
+        )
+        print(f"[INFO] Equity Start NO_REGIME (AUTO, first IN) = {equity_start_no_regime}")
+
+        cfg_no_regime = BacktestConfig(
+            initial_capital=float(equity_start_no_regime),
+            fee_bps=float(args.fee_bps),
+            slippage_bps=float(args.slippage_bps),
+            position_size=1.0,
+        )
+
+        equity_df_no_regime, trades_df_no_regime = backtest_from_hold(df_no_regime, cfg_no_regime)
+
+        # -------------------------
+        # DEBUG / TIME FEATURES (NO_REGIME)
+        # - calcoliamo Trade_ID + Trade_profit (solo su OUT) sulla vista *_no_regime
+        # - aggiungiamo feature temporali (HOUR/DAY/SESSION)
+        # - pre-calcoliamo statistiche time-based per report NO_REGIME
+        # -------------------------
+        try:
+            debug_df_no_regime = add_trade_id_and_profit(df_no_regime)
+        except Exception as e:
+            print(f"[WARN] Impossibile calcolare Trade_ID/Trade_profit NO_REGIME (pre): {e}")
+            debug_df_no_regime = df_no_regime.copy()
+            debug_df_no_regime["Trade_ID"] = pd.Series([pd.NA] * len(debug_df_no_regime), dtype="Int64")
+            debug_df_no_regime["Trade_profit"] = np.nan
+
+        debug_df_no_regime = add_time_features(debug_df_no_regime, datetime_col="datetime")
+        time_stats_df_no_regime, time_summary_no_regime = compute_time_stats(debug_df_no_regime)
+
+
+        if float(equity_start_no_regime) == 100.0:
+            equity_start_no_regime = derive_equity_start_from_first_in_trade(
+                trades_df_no_regime, fallback=float(equity_start_no_regime)
+            )
+
         # Equity Start: per specifica deve provenire dal primo IN (VALUE) nel SIGNAL_.
         # Se per qualsiasi motivo non fosse determinabile (fallback), proviamo come ultima chance dal trades_df.
         if float(equity_start) == 100.0:
@@ -1188,6 +1252,28 @@ def main() -> int:
             sign[side.isin({"SHORT", "SELL", "-1", "S"})] = -1.0
 
             trades_df["pnl_eur"] = ((exit_ - entry) * sign).fillna(0.0)
+
+        # --- pnl_eur anche per NO_REGIME (best-effort) ---
+        try:
+            if trades_df_no_regime is not None and not trades_df_no_regime.empty:
+                entry_ng = _coerce_price_series(trades_df_no_regime["entry_price"])
+                exit_ng = _coerce_price_series(trades_df_no_regime["exit_price"])
+
+                side_ng = (
+                    trades_df_no_regime["side"].astype(str).str.upper().str.strip()
+                    if "side" in trades_df_no_regime.columns
+                    else pd.Series("LONG", index=trades_df_no_regime.index)
+                )
+
+                sign_ng = pd.Series(1.0, index=trades_df_no_regime.index)
+                sign_ng[side_ng.isin({"SHORT", "SELL", "-1", "S"})] = -1.0
+
+                trades_df_no_regime["pnl_eur"] = ((exit_ng - entry_ng) * sign_ng).fillna(0.0)
+        except Exception:
+            pass
+
+
+
 
         # --- SAFETY: gestione caso "nessun trade" ---
         if trades_df is None:
@@ -1377,6 +1463,69 @@ def main() -> int:
         print("[DEBUG] DIRECT metric call Outliers %:", outliers_removed_pct(equity_df, trades_df))
 
         report_df = apply_metrics(equity_df, trades_df)
+        # =============================================================
+        # NO_REGIME: metriche parallele
+        # =============================================================
+        report_df_no_regime = apply_metrics(equity_df_no_regime, trades_df_no_regime)
+
+        # =============================================================
+        
+        # -------------------------------------------------------------
+        # NO_REGIME: Transaction Costs
+        # Nota: i costi di transazione sono indipendenti dal regime;
+        # per stabilità della tabella comparativa, li forziamo anche su NO_REGIME.
+        # -------------------------------------------------------------
+        try:
+            tx_costs_raw_core = _get_metric_raw(report_df, "Transaction Costs")
+            if math.isfinite(tx_costs_raw_core):
+                report_df_no_regime = _upsert_metric(report_df_no_regime, "Transaction Costs", float(tx_costs_raw_core), "€")
+            else:
+                # fallback: se non esiste nel CORE, calcoliamo da equity_df_no_regime
+                tx_costs_ng = 0.0
+                if "cum_costs" in equity_df_no_regime.columns:
+                    s_cost = pd.to_numeric(equity_df_no_regime["cum_costs"], errors="coerce").dropna()
+                    tx_costs_ng = float(s_cost.iloc[-1]) if not s_cost.empty else 0.0
+                report_df_no_regime = _upsert_metric(report_df_no_regime, "Transaction Costs", float(tx_costs_ng), "€")
+        except Exception as e:
+            print(f"[WARN] Impossibile allineare Transaction Costs su NO_REGIME: {e}")
+
+# NO_REGIME: derivate coerenti con CORE
+        # - Expectancy (per Trade) = Net Profit / Number of Round-Trip Trades
+        # - Avg Operations per Week (IN+OUT) = Number of Operations / settimane nel dataset
+        # =============================================================
+        try:
+            # Expectancy
+            net_profit_raw_ng = _get_metric_raw(report_df_no_regime, "Net Profit")
+            n_trades_raw_ng = _get_metric_raw(report_df_no_regime, "Number of Round-Trip Trades")
+            if math.isfinite(net_profit_raw_ng) and math.isfinite(n_trades_raw_ng) and n_trades_raw_ng != 0:
+                expectancy_raw_ng = net_profit_raw_ng / n_trades_raw_ng
+            else:
+                expectancy_raw_ng = float("nan")
+            report_df_no_regime = _upsert_metric(report_df_no_regime, "Expectancy (per Trade)", float(expectancy_raw_ng), "€")
+
+            # Avg Operations per Week (IN+OUT)
+            total_ops_ng = _get_metric_raw(report_df_no_regime, "Number of Operations (IN+OUT)")
+            avg_ops_week_ng = float("nan")
+            try:
+                if "datetime" in df_no_regime.columns:
+                    _dt = pd.to_datetime(df_no_regime["datetime"], errors="coerce", dayfirst=True)
+                else:
+                    _dt = None
+                if _dt is not None:
+                    dt_start = _dt.min()
+                    dt_end = _dt.max()
+                    if pd.notna(dt_start) and pd.notna(dt_end):
+                        weeks = max((dt_end - dt_start).total_seconds() / (7 * 86400.0), 1e-9)
+                        if math.isfinite(total_ops_ng):
+                            avg_ops_week_ng = float(total_ops_ng) / weeks
+            except Exception:
+                pass
+            if math.isfinite(avg_ops_week_ng):
+                report_df_no_regime = _upsert_metric(report_df_no_regime, "Avg Operations per Week (IN+OUT)", avg_ops_week_ng, "ops/week")
+        except Exception as e:
+            print(f"[WARN] Derivate NO_REGIME non calcolabili: {e}")
+
+
         # ------------------------------------------------------------
         # Buy & Hold:
         # - mantieni "Buy & Hold Profit (FILO)" con la definizione originale (da apply_metrics)
@@ -1853,6 +2002,39 @@ def main() -> int:
             s = f"{v:,.{nd}f}"  # es: 1,234.568 (US)
             return s.replace(",", "X").replace(".", ",").replace("X", ".")  # -> 1.234,568 (EU)
 
+        def _coerce_eu_str(x) -> str:
+            """
+            Converte in stringa EU stabile:
+            - se è numero -> _fmt_eu
+            - se è stringa con '.' decimale -> prova a parse e riformatta
+            - altrimenti -> str(x)
+            """
+            if x is None:
+                return ""
+            try:
+                # numeri veri
+                if isinstance(x, (int, float)) and not isinstance(x, bool):
+                    if x != x:
+                        return ""
+                    return _fmt_eu(float(x), 6)
+                s = str(x).strip()
+                if s == "" or s.lower() == "nan":
+                    return ""
+                # prova parse EU/EN: prima sostituisci migliaia, poi decimal
+                # (gestione robusta: "5168.25" / "5.168,25" / "5168,25")
+                s2 = s.replace(" ", "")
+                # se ha sia '.' che ',' assumiamo '.' migliaia e ',' decimale
+                if "." in s2 and "," in s2:
+                    s2 = s2.replace(".", "").replace(",", ".")
+                else:
+                    # se solo ',' => decimale EU
+                    if "," in s2 and "." not in s2:
+                        s2 = s2.replace(",", ".")
+                v = float(s2)
+                return _fmt_eu(v, 6)
+            except Exception:
+                return str(x)
+
         # -------------------------
         # LAST FIX (in-main): Avg Operations per Week (IN+OUT)
         # - usa Valore se Valore_raw mancante
@@ -2091,7 +2273,12 @@ def main() -> int:
             if not s_eq.empty:
                 eq_end = float(s_eq.iloc[-1])
 
-        net_profit = _get_metric_raw(report_df, "Net Profit")
+        # Net Profit REALIZED: somma pnl_eur dei trade (fonte unica e coerente)
+        if isinstance(trades_df, pd.DataFrame) and "pnl_eur" in trades_df.columns and len(trades_df) > 0:
+            net_profit = float(trades_df["pnl_eur"].sum())
+        else:
+            net_profit = 0.0
+    
         if math.isfinite(eq_end) and math.isfinite(net_profit):
             rhs = eq_start + net_profit - float(tx_costs)
             print(
@@ -2176,6 +2363,24 @@ def main() -> int:
                         )
         except Exception as e:
             print(f"[WARN] Impossibile aggiungere time summary al report: {e}")
+
+        # -------------------------
+        # NO_REGIME: aggiungi time summary (Best/Worst Hour/Day/Session) anche al report parallelo
+        # -------------------------
+        try:
+            if "time_summary_no_regime" in locals() and isinstance(time_summary_no_regime, dict) and time_summary_no_regime:
+                for k, v in time_summary_no_regime.items():
+                    if not report_df_no_regime["Indicatore"].eq(k).any():
+                        report_df_no_regime = pd.concat(
+                            [
+                                report_df_no_regime,
+                                pd.DataFrame([{ "Indicatore": k, "Valore": str(v), "Valore_raw": float("nan"), "Unità": "" }]),
+                            ],
+                            ignore_index=True,
+                        )
+        except Exception as e:
+            print(f"[WARN] Impossibile aggiungere time summary al report NO_REGIME: {e}")
+
 
         # -------------------------
         # Prepend Data Inizio / Data Fine / Timeframe al CSV
@@ -2532,6 +2737,113 @@ def main() -> int:
         total_return_alpha = total_return_alpha_str
         unit_total_return_alpha = "%" if total_return_alpha_str != "" else ""
 
+        # =============================================================
+        # NO_REGIME: stessi derivati (cash injections / capital employed / total_pl / ROCE / equity_end_alpha)
+        # =============================================================
+
+        # 1) Unrealized NO_REGIME (stessa regola del core)
+        unreal_pl_no_regime = float("nan")
+        try:
+            if "HOLD" in df_no_regime.columns and len(df_no_regime) > 0:
+                hold_ng = df_no_regime["HOLD"].astype(str).fillna("")
+                if str(hold_ng.iloc[-1]).upper() == "IN":
+                    prev_ng = hold_ng.shift(1).fillna("")
+                    entries_ng = df_no_regime[(hold_ng == "IN") & (prev_ng != "IN")]
+                    if len(entries_ng) == 0:
+                        entries_ng = df_no_regime[hold_ng == "IN"]
+                    if len(entries_ng) > 0:
+                        open_entry_ng = entries_ng.iloc[-1]
+                        side_ng = str(open_entry_ng.get("SIGNAL", "")).strip().upper()
+                        if side_ng not in ("LONG", "SHORT"):
+                            side_ng = "LONG"
+
+                        entry_close_ng = _to_float_eu_local(open_entry_ng.get("close"))
+                        last_close_ng = _to_float_eu_local(df_no_regime.iloc[-1].get("close"))
+
+                        if entry_close_ng == entry_close_ng and last_close_ng == last_close_ng:
+                            unreal_pl_no_regime = (last_close_ng - entry_close_ng) if side_ng == "LONG" else (entry_close_ng - last_close_ng)
+        except Exception:
+            pass
+
+        unreal_pl_no_regime_str = _fmt_eu(unreal_pl_no_regime, 6) if unreal_pl_no_regime == unreal_pl_no_regime else ""
+        unreal_pl_no_regime_unit = "€" if unreal_pl_no_regime_str != "" else ""
+
+        # 2) Equity Start NO_REGIME (già calcolata sopra)
+        equity_start_no_regime_f = float(equity_start_no_regime)
+
+        # 3) Cash injections + max capital employed NO_REGIME da trades_df_no_regime
+        trade_rows_ng = []
+        cash_injections_no_regime = 0.0
+        max_capital_employed_no_regime = 0.0
+
+        try:
+            if isinstance(trades_df_no_regime, pd.DataFrame) and not trades_df_no_regime.empty:
+                for _, tr in trades_df_no_regime.iterrows():
+                    side = str(tr.get("side", "LONG")).upper().strip()
+
+                    entry_price = _to_float_eu_local(tr.get("entry_price"))
+                    exit_price_raw = tr.get("exit_price", None)
+                    exit_price = None if exit_price_raw is None else _to_float_eu_local(exit_price_raw)
+
+                    qty = _to_float_eu_local(tr.get("qty") or tr.get("quantity") or tr.get("size") or 1.0)
+                    qty = float(qty) if (qty is not None and qty == qty) else 1.0
+
+                    if entry_price is None or entry_price != entry_price:
+                        continue
+
+                    trade_rows_ng.append(
+                        {
+                            "side": side,
+                            "entry_price": float(entry_price),
+                            "exit_price": None if (exit_price is None or exit_price != exit_price) else float(exit_price),
+                            "qty": float(qty),
+                        }
+                    )
+
+            if trade_rows_ng:
+                cash_injections_no_regime, max_capital_employed_no_regime = _compute_cash_injections_and_capital(
+                    trade_rows=trade_rows_ng,
+                    equity_start=equity_start_no_regime_f,
+                )
+        except Exception as e:
+            print(f"[WARN] NO_REGIME: Impossibile calcolare Cash Injections / Max Capital Employed: {e}")
+
+        cash_injections_no_regime = cash_injections_no_regime if cash_injections_no_regime == cash_injections_no_regime else 0.0
+        max_capital_employed_no_regime = max_capital_employed_no_regime if max_capital_employed_no_regime == max_capital_employed_no_regime else 0.0
+
+        # 4) Realized P/L NO_REGIME: da Gross Profit/Loss NO_REGIME (già in report_df_no_regime)
+
+        def _m_df(rdf: pd.DataFrame, label: str) -> str:
+            s = rdf.loc[rdf["Indicatore"] == label, "Valore"]
+            return "" if len(s) == 0 else ("" if s.iloc[0] is None else str(s.iloc[0]))
+
+        gp_ng = _to_float_eu_local(_m_df(report_df_no_regime, "Gross Profit (Winning Trades Only)"))
+        gl_ng = _to_float_eu_local(_m_df(report_df_no_regime, "Gross Loss (Losing Trades Only)"))
+
+
+        net_profit_realized_no_regime = 0.0
+        try:
+            if gp_ng == gp_ng and gl_ng == gl_ng:
+                net_profit_realized_no_regime = float(gp_ng + gl_ng)
+        except Exception:
+            net_profit_realized_no_regime = 0.0
+
+        total_pl_no_regime = net_profit_realized_no_regime + (unreal_pl_no_regime if unreal_pl_no_regime == unreal_pl_no_regime else 0.0)
+
+        equity_end_no_regime = equity_start_no_regime_f + total_pl_no_regime + cash_injections_no_regime
+        roce_no_regime = (total_pl_no_regime / max_capital_employed_no_regime) if (max_capital_employed_no_regime and max_capital_employed_no_regime > 0) else float("nan")
+
+        net_profit_alpha_no_regime_str = _fmt_eu(total_pl_no_regime, 6) if total_pl_no_regime == total_pl_no_regime else ""
+        net_profit_alpha_no_regime_unit = "€" if net_profit_alpha_no_regime_str != "" else ""
+
+        equity_end_alpha_no_regime_str = _fmt_eu(equity_end_no_regime, 6) if equity_end_no_regime == equity_end_no_regime else ""
+        unit_equity_end_alpha_no_regime = "€" if equity_end_alpha_no_regime_str != "" else ""
+
+        roce_no_regime_str = _fmt_eu(roce_no_regime * 100.0, 6) if roce_no_regime == roce_no_regime else ""
+        roce_no_regime_unit = "%" if roce_no_regime_str != "" else ""
+
+
+
         # ------------------------------------------------------------
         # 3) Buy&Hold (Full Holding) = primo IN -> ultimo close (sempre LONG)
         # ------------------------------------------------------------
@@ -2565,6 +2877,30 @@ def main() -> int:
 
         outperf_fh_str = _fmt_eu(outperf_fh, 6) if outperf_fh == outperf_fh else ""
         outperf_fh_unit = "%" if outperf_fh_str != "" else ""
+
+        # ------------------------------------------------------------
+        # NO_REGIME derived metrics missing in apply_metrics
+        # ------------------------------------------------------------
+        # Profit Factor (NO_REGIME): Gross Profit / |Gross Loss|
+        profit_factor_no_regime = float("nan")
+        if gp_ng == gp_ng and gl_ng == gl_ng and gl_ng != 0.0:
+            profit_factor_no_regime = float(gp_ng / abs(gl_ng))
+        profit_factor_no_regime_str = _fmt_eu(profit_factor_no_regime, 6) if profit_factor_no_regime == profit_factor_no_regime else ""
+        profit_factor_no_regime_unit = "ratio" if profit_factor_no_regime_str != "" else ""
+
+        # Total Return (Additive) (NO_REGIME): Total P/L / Equity Start * 100
+        total_return_additive_no_regime = float("nan")
+        if total_pl_no_regime == total_pl_no_regime and equity_start_no_regime_f and equity_start_no_regime_f != 0.0:
+            total_return_additive_no_regime = float((total_pl_no_regime / equity_start_no_regime_f) * 100.0)
+        total_return_additive_no_regime_str = _fmt_eu(total_return_additive_no_regime, 6) if total_return_additive_no_regime == total_return_additive_no_regime else ""
+        total_return_additive_no_regime_unit = "%" if total_return_additive_no_regime_str != "" else ""
+
+        # Strategy Alpha Outperformance (FH) (NO_REGIME): (Total P/L - BH Full) / |BH Full| * 100
+        outperf_fh_no_regime = float("nan")
+        if total_pl_no_regime == total_pl_no_regime and bh_full == bh_full and bh_full != 0.0:
+            outperf_fh_no_regime = float(((total_pl_no_regime - bh_full) / abs(bh_full)) * 100.0)
+        outperf_fh_no_regime_str = _fmt_eu(outperf_fh_no_regime, 6) if outperf_fh_no_regime == outperf_fh_no_regime else ""
+        outperf_fh_no_regime_unit = "%" if outperf_fh_no_regime_str != "" else ""
 
         # buy&hold FILO (rimane)
         bh_filo = m("Buy & Hold Profit (FILO)")
@@ -2646,18 +2982,71 @@ def main() -> int:
             (SEP, None, None),
         ]
 
+        # -------------------------------------------------------------
+        # NO_REGIME overrides: metriche "derivate" che NON arrivano da apply_metrics
+        # (e/o che vogliamo forzare in formato EU coerente)
+        # -------------------------------------------------------------
+        override_no_regime = {
+            "Equity Start": (_fmt_eu(float(equity_start_no_regime), 2), "EUR"),
+            "Cash Injections": (
+                _fmt_eu(float(cash_injections_no_regime), 6) if cash_injections_no_regime else "",
+                "€" if cash_injections_no_regime else "",
+            ),
+            "Max Capital Employed": (
+                _fmt_eu(float(max_capital_employed_no_regime), 6) if max_capital_employed_no_regime else "",
+                "€" if max_capital_employed_no_regime else "",
+            ),
+            "Total P/L (Real + Unreal)": (
+                _fmt_eu(float(total_pl_no_regime), 6) if total_pl_no_regime == total_pl_no_regime else "",
+                "€" if total_pl_no_regime == total_pl_no_regime else "",
+            ),
+            "ROCE": (roce_no_regime_str, roce_no_regime_unit),
+            "Equity End Alpha": (equity_end_alpha_no_regime_str, unit_equity_end_alpha_no_regime),
+            "Total Return Alpha": (roce_no_regime_str, roce_no_regime_unit),
+            "Net Profit Alpha": (net_profit_alpha_no_regime_str, net_profit_alpha_no_regime_unit),
+            "Unrealized Profit/Loss": (unreal_pl_no_regime_str, unreal_pl_no_regime_unit),
+            "Buy&Hold Profit (Full Holding)": (bh_full_str, bh_full_unit),
+            "Strategy Alpha Outperformance (FH)": (outperf_fh_no_regime_str, outperf_fh_no_regime_unit),
+            "Equity End Buy&Hold": (equity_end_bh, unit_equity_end_bh),
+            "Profit Factor": (profit_factor_no_regime_str, profit_factor_no_regime_unit),
+            "Total Return (Additive)": (total_return_additive_no_regime_str, total_return_additive_no_regime_unit),
+        }
+
         rows = []
+
         for label, value, unit in FINAL_ORDER:
             if label == SEP:
-                rows.append({"Indicatore": SEP, "Valore": "", "Unità": ""})
-            else:
-                rows.append({
-                    "Indicatore": label,
-                    "Valore": "" if value is None else value,
-                    "Unità": "" if unit is None else unit
-                })
+                rows.append([SEP, "", "", "", ""])
+                continue
 
-        report_df_final = pd.DataFrame(rows)
+            # CORE
+            v_core = "" if value is None else value
+            u_core = "" if unit is None else unit
+
+            # NO_REGIME
+            if label in ("Symbol", "Strategia", "Data Inizio", "Data Fine", "Timeframe"):
+                # intestazioni replicate identiche
+                v_ng = v_core
+                u_ng = u_core
+            else:
+                # 1) prima prova override (derivati)
+                if label in override_no_regime:
+                    v_ng, u_ng = override_no_regime[label]
+                else:
+                    # 2) fallback: lookup in report_df_no_regime (apply_metrics)
+                    s_val = report_df_no_regime.loc[report_df_no_regime["Indicatore"] == label, "Valore"]
+                    s_unit = report_df_no_regime.loc[report_df_no_regime["Indicatore"] == label, "Unità"]
+
+                    v_ng = "" if len(s_val) == 0 else ("" if s_val.iloc[0] is None else _coerce_eu_str(s_val.iloc[0]))
+                    u_ng = "" if len(s_unit) == 0 else ("" if s_unit.iloc[0] is None else str(s_unit.iloc[0]))
+
+            rows.append([label, v_core, u_core, v_ng, u_ng])
+
+        report_df_final = pd.DataFrame(
+            rows,
+            columns=["Indicatore", "Valore", "Unità", "STRATEGIA_NO_REGIME", "Unità"],
+        )
+
 
         # -------------------------
         # Export (AUTHORITATIVE)
