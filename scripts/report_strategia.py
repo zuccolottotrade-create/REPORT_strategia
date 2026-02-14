@@ -50,32 +50,32 @@ from pathlib import Path
 def _print_report_table(df: pd.DataFrame, out_path: Path, max_rows: int = 30) -> None:
     import pandas as pd
 
-    print("\n==============================")
-    print(" REPORT (ANTEPRIMA CSV)")
-    print("==============================")
-    print(f"Output: {out_path}")
+#    print("\n==============================")
+#    print(" REPORT (ANTEPRIMA CSV)")
+#    print("==============================")
+#    print(f"Output: {out_path}")
 
-    if df is None or df.empty:
-        print("(DataFrame vuoto)\n")
-        return
+#    if df is None or df.empty:
+#        print("(DataFrame vuoto)\n")
+#        return
 
-    pd.set_option("display.width", 220)
-    pd.set_option("display.max_columns", 100)
-    pd.set_option("display.max_colwidth", 60)
+#    pd.set_option("display.width", 220)
+#    pd.set_option("display.max_columns", 100)
+#    pd.set_option("display.max_colwidth", 60)
 
-    print(f"Righe: {len(df)} | Colonne: {len(df.columns)}")
-    print("Colonne:", list(df.columns))
+#    print(f"Righe: {len(df)} | Colonne: {len(df.columns)}")
+#    print("Colonne:", list(df.columns))
 
-    if len(df) <= max_rows:
-        print(df.to_string(index=False))
-    else:
-        head_n = max_rows // 2
-        tail_n = max_rows - head_n
-        print("\n--- HEAD ---")
-        print(df.head(head_n).to_string(index=False))
-        print("\n--- TAIL ---")
-        print(df.tail(tail_n).to_string(index=False))
-    print("")
+#    if len(df) <= max_rows:
+#        print(df.to_string(index=False))
+#    else:
+#        head_n = max_rows // 2
+#        tail_n = max_rows - head_n
+#        print("\n--- HEAD ---")
+#        print(df.head(head_n).to_string(index=False))
+#        print("\n--- TAIL ---")
+#        print(df.tail(tail_n).to_string(index=False))
+#    print("")
 
 
 
@@ -791,19 +791,19 @@ def export_debug_signal_csv(path: Path, df: pd.DataFrame) -> None:
         pd.set_option("display.max_colwidth", 40)
 
         n = len(df)
-        print("\n=== ANTEPRIMA CSV REPORT (in scrittura) ===")
-        print(f"Path: {path}")
-        print(f"Righe: {n} | Colonne: {len(df.columns)}")
-        print("Colonne:", list(df.columns))
+#        print("\n=== ANTEPRIMA CSV REPORT (in scrittura) ===")
+#        print(f"Path: {path}")
+#        print(f"Righe: {n} | Colonne: {len(df.columns)}")
+#        print("Colonne:", list(df.columns))
 
-        if n <= 20:
-            print(df.to_string(index=False))
-        else:
-            print("\n--- HEAD ---")
-            print(df.head(10).to_string(index=False))
-            print("\n--- TAIL ---")
-            print(df.tail(10).to_string(index=False))
-        print("")
+#        if n <= 20:
+#            print(df.to_string(index=False))
+ #       else:
+#            print("\n--- HEAD ---")
+#            print(df.head(10).to_string(index=False))
+#            print("\n--- TAIL ---")
+#            print(df.tail(10).to_string(index=False))
+#        print("")
 
     # ===== SCRITTURA CSV =====
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2315,7 +2315,8 @@ def main() -> int:
             "Win Rate (Round-Trip)",
             "AVG Win",
             "AVG Loss",
-            "Expectancy (per Trade)",            "Gross Profit (-Outlier)",
+            "Expectancy (per Trade)",
+            "Gross Profit (-Outlier)",
             "Gross Loss (-Outlier)",
             "Net Profit (-Outlier)",
             "Outliers Removed (count)",
@@ -2930,6 +2931,7 @@ def main() -> int:
             ("Total P/L (Real + Unreal)", _fmt_eu(total_pl, 6) if total_pl == total_pl else "", "€" if (total_pl == total_pl) else ""),
             ("ROCE", total_return_alpha, unit_total_return_alpha),
             ("Equity End Alpha", equity_end_alpha_str, unit_equity_end_alpha),
+            ("Equity End Buy&Hold", equity_end_bh, unit_equity_end_bh),
             ("Buy&Hold Profit (Full Holding)", bh_full_str, bh_full_unit),
 
 
@@ -2946,7 +2948,7 @@ def main() -> int:
             ("Unrealized Profit/Loss", unreal_pl_str, unreal_unit),
             ("Buy & Hold Profit (FILO)", bh_filo, unit_bh_filo),
 
-            ("Equity End Buy&Hold", equity_end_bh, unit_equity_end_bh),
+
 
             ("Total Return", m("Total Return"), u("Total Return")),
             ("Max Drawdown (Additive)", m("Max Drawdown (Additive)"), u("Max Drawdown (Additive)") or "€"),
@@ -3067,6 +3069,50 @@ def main() -> int:
             print(f"[ERROR] Export CSV fallito: {_e}")
             raise
         print(f"[OK] Report export (final): {out_report}")
+        # ============================================================
+        # AUTO-PLOT (post Report CSV)
+        # Lancia plot_strategy_2.py sullo stesso file SIGNAL_ (src)
+        # Output: <out_dir>/plots/PLOT_<SIGNAL_STEM>.png + .html
+        # ============================================================
+        try:
+            import subprocess
+            import sys
+            import pathlib
+
+            plot_script = pathlib.Path(__file__).resolve().parent / "plot_strategy_2.py"
+            if plot_script.exists():
+
+                cmd = [
+                    sys.executable,
+                    str(plot_script),
+                    "--format", "both",
+                    "--input", str(src),
+                    "--outdir", str(out_dir),
+                ]
+
+                print(f"[INFO] Avvio plot_strategy_2.py: {plot_script.name}")
+                print(f"[INFO] Avvio plot_strategy_2.py: {plot_script.name}")
+                print("[INFO] plot cmd:", " ".join(cmd))
+                print("[INFO] plot cwd:", str(Path.cwd()))
+                print("[INFO] plot python:", sys.executable)
+
+                print("[INFO] plot script:", str(plot_script.resolve()))
+                print("[INFO] plot input:", str(src))
+                print("[INFO] plot outdir:", str((out_dir / "plots").resolve()))
+
+                p = subprocess.run(cmd, capture_output=True, text=True)
+                print("[INFO] plot rc:", p.returncode)
+
+                if p.stdout:
+                    print("[PLOT][STDOUT]\n" + p.stdout)
+                if p.stderr:
+                    print("[PLOT][STDERR]\n" + p.stderr)
+
+            else:
+                print("[WARN] plot_strategy_2.py non trovato: plot saltato")
+        except Exception as e:
+            print("[WARN] Plot strategia non eseguito:", repr(e))
+
 
 
         # Debug dump completo SIGNAL + Trade_ID + Trade_profit (+ TIME features)
